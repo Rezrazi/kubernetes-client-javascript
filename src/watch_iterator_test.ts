@@ -61,6 +61,7 @@ function createMockConfiguration(
 
     // Create a mock auth method that does nothing
     const mockAuth = {
+        getName: () => 'mock',
         applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
     };
 
@@ -206,6 +207,7 @@ describe('WatchIterator', () => {
         });
 
         const mockAuth = {
+            getName: () => 'mock',
             applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
         };
 
@@ -289,6 +291,7 @@ describe('WatchIterator with custom HTTP library', () => {
         });
 
         const mockAuth = {
+            getName: () => 'mock',
             applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
         };
 

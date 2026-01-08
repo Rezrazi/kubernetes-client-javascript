@@ -1,9 +1,6 @@
-import { STATUS_CODES } from 'node:http';
 import { createInterface } from 'node:readline';
-import fetch, { RequestInit as NodeFetchRequestInit, Response as NodeFetchResponse } from 'node-fetch';
 import { KubernetesObject } from './types.js';
-import { KubeConfig } from './config.js';
-import { Configuration, ApiException } from './gen/index.js';
+import { Configuration, ApiException, HttpMethod } from './gen/index.js';
 
 /**
  * Represents the type of watch event received from the Kubernetes API.
@@ -46,10 +43,12 @@ export interface WatchEvent<T extends KubernetesObject> {
 
 /**
  * A watch API implementation that uses async iterators and follows the generated
- * Kubernetes API client pattern. This allows users to use it with `makeApiClient`.
+ * Kubernetes API client pattern. This allows users to use it with `makeApiClient`
+ * and override the HTTP library via `wrapHttpLibrary` and `createConfiguration`.
  *
- * The class uses streaming to read lines from the response body, similar to the
- * original `Watch` class, but provides an async iterator interface instead of callbacks.
+ * The class uses the configuration's `httpApi` to send requests, enabling custom
+ * HTTP implementations. For optimal streaming support, custom HTTP libraries should
+ * return a response body with a `stream()` method that returns a Readable stream.
  *
  * @example Using with makeApiClient:
  * ```typescript
@@ -59,6 +58,48 @@ export interface WatchEvent<T extends KubernetesObject> {
  * kubeConfig.loadFromDefault();
  *
  * const watchApi = kubeConfig.makeApiClient(WatchApi);
+ *
+ * for await (const event of watchApi.watch<V1Pod>('/api/v1/namespaces/default/pods')) {
+ *   console.log(`${event.type}: ${event.object.metadata?.name}`);
+ * }
+ * ```
+ *
+ * @example With custom HTTP library:
+ * ```typescript
+ * import { KubeConfig, WatchApi, V1Pod, wrapHttpLibrary, createConfiguration, ServerConfiguration, ResponseContext } from '@kubernetes/client-node';
+ * import { Readable } from 'node:stream';
+ * import ky from 'ky';
+ *
+ * const httpApi = wrapHttpLibrary({
+ *   async send(request) {
+ *     const response = await ky(request.getUrl(), {
+ *       method: request.getHttpMethod(),
+ *       headers: request.getHeaders(),
+ *       body: request.getBody(),
+ *     });
+ *
+ *     return new ResponseContext(
+ *       response.status,
+ *       Object.fromEntries(response.headers.entries()),
+ *       {
+ *         text: () => response.text(),
+ *         binary: async () => Buffer.from(await response.arrayBuffer()),
+ *         stream: () => Readable.fromWeb(response.body),  // Enable streaming for watch
+ *       },
+ *     );
+ *   },
+ * });
+ *
+ * const kubeConfig = new KubeConfig();
+ * kubeConfig.loadFromDefault();
+ *
+ * const configuration = createConfiguration({
+ *   baseServer: new ServerConfiguration(kubeConfig.getCurrentCluster()!.server, {}),
+ *   authMethods: { default: kubeConfig },
+ *   httpApi,
+ * });
+ *
+ * const watchApi = new WatchApi(configuration);
  *
  * for await (const event of watchApi.watch<V1Pod>('/api/v1/namespaces/default/pods')) {
  *   console.log(`${event.type}: ${event.object.metadata?.name}`);
@@ -112,8 +153,12 @@ export class WatchApi {
      * Watches for changes to Kubernetes resources at the specified path.
      * Returns an async iterator that yields watch events.
      *
-     * Uses streaming to read lines from the response body, avoiding loading the entire
-     * response into memory.
+     * Uses the configuration's httpApi to send the request, allowing users to override
+     * the HTTP implementation via `wrapHttpLibrary` and `createConfiguration`.
+     *
+     * For optimal streaming support, custom HTTP libraries should return a response body
+     * with a `stream()` method. If streaming is not available, the full response text
+     * will be parsed.
      *
      * @typeParam T - The Kubernetes object type to expect (e.g., V1Pod, V1Deployment).
      *
@@ -139,71 +184,72 @@ export class WatchApi {
         path: string,
         queryParams: Record<string, string | number | boolean | undefined> = {},
     ): AsyncGenerator<WatchEvent<T>, void, undefined> {
-        // Get the KubeConfig from the auth methods to access server URL and apply auth
-        const authMethod = this.configuration.authMethods.default;
-        if (!authMethod || !('getCurrentCluster' in authMethod)) {
-            throw new ApiException(500, 'WatchApi requires KubeConfig as the authentication method', '', {});
-        }
-
-        const kubeConfig = authMethod as KubeConfig;
-        const cluster = kubeConfig.getCurrentCluster();
-        if (!cluster) {
-            throw new ApiException(500, 'No active cluster', '', {});
-        }
-
-        const watchURL = new URL(cluster.server + path);
-        watchURL.searchParams.set('watch', 'true');
+        // Build request context using the configuration's base server
+        const requestContext = this.configuration.baseServer.makeRequestContext(path, HttpMethod.GET);
+        requestContext.setQueryParam('watch', 'true');
 
         for (const [key, val] of Object.entries(queryParams)) {
             if (val !== undefined) {
-                watchURL.searchParams.set(key, val.toString());
+                requestContext.setQueryParam(key, val.toString());
             }
         }
 
-        const requestInit: NodeFetchRequestInit = await kubeConfig.applyToFetchOptions({});
+        // Apply authentication
+        const authMethod = this.configuration.authMethods.default;
+        if (authMethod?.applySecurityAuthentication) {
+            await authMethod.applySecurityAuthentication(requestContext);
+        }
 
+        // Set timeout signal
         const controller = new AbortController();
         const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
-        requestInit.signal = AbortSignal.any([controller.signal, timeoutSignal]);
-        requestInit.method = 'GET';
+        requestContext.setSignal(AbortSignal.any([controller.signal, timeoutSignal]));
 
-        let response: NodeFetchResponse;
         try {
-            response = await fetch(watchURL, requestInit);
+            // Send request using the configured HTTP library
+            const response = await this.configuration.httpApi.send(requestContext).toPromise();
 
-            if (requestInit.agent && typeof requestInit.agent === 'object') {
-                const agent = requestInit.agent as { sockets?: Record<string, unknown[]> };
-                if (agent.sockets) {
-                    for (const socket of Object.values(agent.sockets).flat()) {
-                        const sock = socket as {
-                            setKeepAlive?: (enable: boolean, initialDelay: number) => void;
+            if (response.httpStatusCode !== 200) {
+                const body = await response.body.text();
+                throw new ApiException(
+                    response.httpStatusCode,
+                    'Watch request failed',
+                    body,
+                    response.headers,
+                );
+            }
+
+            // Use streaming if available, otherwise fall back to text parsing
+            if (response.body.stream) {
+                const stream = response.body.stream();
+                const lines = createInterface(stream);
+
+                for await (const line of lines) {
+                    try {
+                        const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
+                        yield {
+                            type: data.type,
+                            object: data.object,
                         };
-                        sock?.setKeepAlive?.(true, 30000);
+                    } catch {
+                        // ignore parse errors
                     }
                 }
-            }
+            } else {
+                // Fallback: parse full text response line by line
+                const text = await response.body.text();
+                const lines = text.split('\n').filter((line) => line.trim() !== '');
 
-            if (response.status !== 200) {
-                const statusText =
-                    response.statusText || STATUS_CODES[response.status] || 'Internal Server Error';
-                const body = await response.text();
-                throw new ApiException(response.status, statusText, body, {});
-            }
-
-            const body = response.body!;
-
-            // Create an async iterator from the readline interface
-            const lines = createInterface(body);
-
-            for await (const line of lines) {
-                try {
-                    const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
-                    yield {
-                        type: data.type,
-                        object: data.object,
-                    };
-                } catch {
-                    // ignore parse errors
+                for (const line of lines) {
+                    try {
+                        const data = JSON.parse(line) as { type: WatchEventType; object: T };
+                        yield {
+                            type: data.type,
+                            object: data.object,
+                        };
+                    } catch {
+                        // ignore parse errors
+                    }
                 }
             }
         } finally {

@@ -1,87 +1,65 @@
 import { describe, it } from 'node:test';
+import { Readable } from 'node:stream';
 import { deepStrictEqual, strictEqual, rejects } from 'node:assert';
-import { createServer, ServerResponse, IncomingMessage } from 'node:http';
-import { AddressInfo } from 'node:net';
-import { KubeConfig } from './config.js';
-import { Cluster, Context, User } from './config_types.js';
 import { WatchApi, WatchEvent } from './watch_iterator.js';
-import { ApiException } from './gen/index.js';
+import {
+    ApiException,
+    createConfiguration,
+    wrapHttpLibrary,
+    ServerConfiguration,
+    ResponseContext,
+    RequestContext,
+} from './gen/index.js';
 
 const server = 'https://foo.company.com';
 
-const fakeConfig: {
-    clusters: Cluster[];
-    contexts: Context[];
-    users: User[];
-} = {
-    clusters: [
-        {
-            name: 'cluster',
-            server,
-        } as Cluster,
-    ],
-    contexts: [
-        {
-            cluster: 'cluster',
-            user: 'user',
-            name: 'context',
-        } as Context,
-    ],
-    users: [
-        {
-            name: 'user',
-        } as User,
-    ],
-};
-
 /**
- * Creates a KubeConfig with a test HTTP server that allows HTTP connections.
+ * Creates a mock configuration with a custom HTTP library for testing.
  */
-function createKubeConfigForServer(serverUrl: string): KubeConfig {
-    const kc = new KubeConfig();
-    Object.assign(kc, {
-        clusters: [{ name: 'cluster', server: serverUrl, skipTLSVerify: true } as Cluster],
-        contexts: [{ cluster: 'cluster', user: 'user', name: 'context' } as Context],
-        users: [{ name: 'user' } as User],
-    });
-    kc.setCurrentContext('context');
-    return kc;
-}
-
-/**
- * Creates a test HTTP server that responds with the given body.
- */
-async function createTestServer(
+function createMockConfiguration(
+    baseUrl: string,
     responseBody: string,
     statusCode: number = 200,
-): Promise<{ url: string; close: () => void }> {
-    return new Promise((resolve) => {
-        const testServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-            res.statusCode = statusCode;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(responseBody);
-        });
+    useStreaming: boolean = false,
+) {
+    const httpApi = wrapHttpLibrary({
+        async send(_request: RequestContext): Promise<ResponseContext> {
+            const body = useStreaming
+                ? {
+                      text: () => Promise.resolve(responseBody),
+                      binary: () => Promise.resolve(Buffer.from(responseBody)),
+                      stream: () => Readable.from(responseBody),
+                  }
+                : {
+                      text: () => Promise.resolve(responseBody),
+                      binary: () => Promise.resolve(Buffer.from(responseBody)),
+                  };
 
-        testServer.listen(0, '127.0.0.1', () => {
-            const address = testServer.address() as AddressInfo;
-            resolve({
-                url: `http://127.0.0.1:${address.port}`,
-                close: () => testServer.close(),
-            });
-        });
+            return new ResponseContext(statusCode, {}, body);
+        },
+    });
+
+    // Create a mock auth method that does nothing
+    const mockAuth = {
+        getName: () => 'mock',
+        applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
+    };
+
+    return createConfiguration({
+        baseServer: new ServerConfiguration(baseUrl, {}),
+        authMethods: { default: mockAuth },
+        httpApi,
     });
 }
 
 describe('WatchApi', () => {
     it('should construct correctly', () => {
-        const kc = new KubeConfig();
-        Object.assign(kc, fakeConfig);
-        kc.setCurrentContext('context');
-        const watchApi = kc.makeApiClient(WatchApi);
+        const config = createMockConfiguration(server, '');
+        const watchApi = new WatchApi(config);
         strictEqual(watchApi instanceof WatchApi, true);
     });
 
-    it('should iterate over watch events', async () => {
+    it('should iterate over watch events using text fallback', async () => {
         const events = [
             { type: 'ADDED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
             { type: 'MODIFIED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
@@ -89,25 +67,42 @@ describe('WatchApi', () => {
         ];
 
         const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
-        const testServer = await createTestServer(responseBody);
+        const config = createMockConfiguration(server, responseBody);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            const receivedEvents: WatchEvent<any>[] = [];
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                receivedEvents.push(event);
-            }
-
-            strictEqual(receivedEvents.length, 3);
-            deepStrictEqual(receivedEvents[0].type, 'ADDED');
-            deepStrictEqual(receivedEvents[1].type, 'MODIFIED');
-            deepStrictEqual(receivedEvents[2].type, 'DELETED');
-            deepStrictEqual(receivedEvents[0].object.metadata?.name, 'pod1');
-        } finally {
-            testServer.close();
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
         }
+
+        strictEqual(receivedEvents.length, 3);
+        deepStrictEqual(receivedEvents[0].type, 'ADDED');
+        deepStrictEqual(receivedEvents[1].type, 'MODIFIED');
+        deepStrictEqual(receivedEvents[2].type, 'DELETED');
+        deepStrictEqual(receivedEvents[0].object.metadata?.name, 'pod1');
+    });
+
+    it('should iterate over watch events using streaming', async () => {
+        const events = [
+            { type: 'ADDED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
+            { type: 'MODIFIED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
+            { type: 'DELETED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
+        ];
+
+        const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
+        const config = createMockConfiguration(server, responseBody, 200, true);
+        const watchApi = new WatchApi(config);
+
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
+        }
+
+        strictEqual(receivedEvents.length, 3);
+        deepStrictEqual(receivedEvents[0].type, 'ADDED');
+        deepStrictEqual(receivedEvents[1].type, 'MODIFIED');
+        deepStrictEqual(receivedEvents[2].type, 'DELETED');
+        deepStrictEqual(receivedEvents[0].object.metadata?.name, 'pod1');
     });
 
     it('should handle BOOKMARK events', async () => {
@@ -120,22 +115,16 @@ describe('WatchApi', () => {
         ];
 
         const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
-        const testServer = await createTestServer(responseBody);
+        const config = createMockConfiguration(server, responseBody);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            const receivedEvents: WatchEvent<any>[] = [];
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                receivedEvents.push(event);
-            }
-
-            strictEqual(receivedEvents.length, 2);
-            deepStrictEqual(receivedEvents[1].type, 'BOOKMARK');
-        } finally {
-            testServer.close();
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
         }
+
+        strictEqual(receivedEvents.length, 2);
+        deepStrictEqual(receivedEvents[1].type, 'BOOKMARK');
     });
 
     it('should handle ERROR events in the watch stream', async () => {
@@ -145,48 +134,36 @@ describe('WatchApi', () => {
         ];
 
         const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
-        const testServer = await createTestServer(responseBody);
+        const config = createMockConfiguration(server, responseBody);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            const receivedEvents: WatchEvent<any>[] = [];
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                receivedEvents.push(event);
-            }
-
-            strictEqual(receivedEvents.length, 2);
-            deepStrictEqual(receivedEvents[1].type, 'ERROR');
-            deepStrictEqual(receivedEvents[1].object.code, 410);
-        } finally {
-            testServer.close();
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
         }
+
+        strictEqual(receivedEvents.length, 2);
+        deepStrictEqual(receivedEvents[1].type, 'ERROR');
+        deepStrictEqual(receivedEvents[1].object.code, 410);
     });
 
     it('should throw ApiException on non-200 status', async () => {
-        const testServer = await createTestServer('Internal Server Error', 500);
+        const config = createMockConfiguration(server, 'Internal Server Error', 500);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            await rejects(
-                async () => {
-                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                    for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                        // Should not reach here
-                    }
-                },
-                (err: Error) => {
-                    strictEqual(err instanceof ApiException, true);
-                    strictEqual((err as ApiException<unknown>).code, 500);
-                    return true;
-                },
-            );
-        } finally {
-            testServer.close();
-        }
+        await rejects(
+            async () => {
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+                    // Should not reach here
+                }
+            },
+            (err: Error) => {
+                strictEqual(err instanceof ApiException, true);
+                strictEqual((err as ApiException<unknown>).code, 500);
+                return true;
+            },
+        );
     });
 
     it('should skip invalid JSON lines', async () => {
@@ -195,88 +172,128 @@ describe('WatchApi', () => {
             object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } },
         };
         const responseBody = `${JSON.stringify(validEvent)}\n{"invalid json\n${JSON.stringify(validEvent)}`;
-        const testServer = await createTestServer(responseBody);
+        const config = createMockConfiguration(server, responseBody);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            const receivedEvents: WatchEvent<any>[] = [];
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                receivedEvents.push(event);
-            }
-
-            // Should only receive 2 valid events, skipping the invalid JSON line
-            strictEqual(receivedEvents.length, 2);
-        } finally {
-            testServer.close();
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
         }
+
+        // Should only receive 2 valid events, skipping the invalid JSON line
+        strictEqual(receivedEvents.length, 2);
     });
 
     it('should pass query parameters correctly', async () => {
         let capturedUrl: string = '';
 
-        const testServer = await new Promise<{ url: string; close: () => void }>((resolve) => {
-            const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-                capturedUrl = req.url || '';
+        const httpApi = wrapHttpLibrary({
+            async send(request: RequestContext): Promise<ResponseContext> {
+                capturedUrl = request.getUrl();
                 const event = {
                     type: 'ADDED',
                     object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } },
                 };
-                res.statusCode = 200;
-                res.setHeader('Content-Type', 'application/json');
-                res.end(JSON.stringify(event));
-            });
-
-            server.listen(0, '127.0.0.1', () => {
-                const address = server.address() as AddressInfo;
-                resolve({
-                    url: `http://127.0.0.1:${address.port}`,
-                    close: () => server.close(),
-                });
-            });
+                return new ResponseContext(
+                    200,
+                    {},
+                    {
+                        text: () => Promise.resolve(JSON.stringify(event)),
+                        binary: () => Promise.resolve(Buffer.from(JSON.stringify(event))),
+                    },
+                );
+            },
         });
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
+        const mockAuth = {
+            getName: () => 'mock',
+            applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
+        };
 
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods', {
-                resourceVersion: '12345',
-                labelSelector: 'app=nginx',
-                fieldSelector: 'metadata.name=my-pod',
-                allowWatchBookmarks: true,
-            })) {
-                // Just consume the event
-            }
+        const config = createConfiguration({
+            baseServer: new ServerConfiguration(server, {}),
+            authMethods: { default: mockAuth },
+            httpApi,
+        });
 
-            strictEqual(capturedUrl.includes('watch=true'), true);
-            strictEqual(capturedUrl.includes('resourceVersion=12345'), true);
-            strictEqual(capturedUrl.includes('labelSelector=app%3Dnginx'), true);
-            strictEqual(capturedUrl.includes('fieldSelector=metadata.name%3Dmy-pod'), true);
-            strictEqual(capturedUrl.includes('allowWatchBookmarks=true'), true);
-        } finally {
-            testServer.close();
+        const watchApi = new WatchApi(config);
+
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods', {
+            resourceVersion: '12345',
+            labelSelector: 'app=nginx',
+            fieldSelector: 'metadata.name=my-pod',
+            allowWatchBookmarks: true,
+        })) {
+            // Just consume the event
         }
+
+        strictEqual(capturedUrl.includes('watch=true'), true);
+        strictEqual(capturedUrl.includes('resourceVersion=12345'), true);
+        strictEqual(capturedUrl.includes('labelSelector=app%3Dnginx'), true);
+        strictEqual(capturedUrl.includes('fieldSelector=metadata.name%3Dmy-pod'), true);
+        strictEqual(capturedUrl.includes('allowWatchBookmarks=true'), true);
     });
 
     it('should handle empty response', async () => {
-        const testServer = await createTestServer('');
+        const config = createMockConfiguration(server, '');
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            const receivedEvents: WatchEvent<any>[] = [];
-            for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-                receivedEvents.push(event);
-            }
-
-            strictEqual(receivedEvents.length, 0);
-        } finally {
-            testServer.close();
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
         }
+
+        strictEqual(receivedEvents.length, 0);
+    });
+});
+
+describe('WatchApi with custom HTTP library', () => {
+    it('should work with custom HTTP implementation', async () => {
+        const events = [
+            { type: 'ADDED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'custom-pod' } } },
+        ];
+        const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
+
+        // Custom HTTP implementation
+        const customHttpApi = wrapHttpLibrary({
+            async send(request: RequestContext): Promise<ResponseContext> {
+                // Verify we receive the request correctly
+                strictEqual(request.getHttpMethod(), 'GET');
+                strictEqual(request.getUrl().includes('/api/v1/namespaces/default/pods'), true);
+
+                return new ResponseContext(
+                    200,
+                    { 'content-type': 'application/json' },
+                    {
+                        text: () => Promise.resolve(responseBody),
+                        binary: () => Promise.resolve(Buffer.from(responseBody)),
+                        stream: () => Readable.from(responseBody),
+                    },
+                );
+            },
+        });
+
+        const mockAuth = {
+            getName: () => 'mock',
+            applySecurityAuthentication: async (_context: RequestContext): Promise<void> => {},
+        };
+
+        const configuration = createConfiguration({
+            baseServer: new ServerConfiguration(server, {}),
+            authMethods: { default: mockAuth },
+            httpApi: customHttpApi,
+        });
+
+        const watchApi = new WatchApi(configuration);
+
+        const receivedEvents: WatchEvent<any>[] = [];
+        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
+            receivedEvents.push(event);
+        }
+
+        strictEqual(receivedEvents.length, 1);
+        deepStrictEqual(receivedEvents[0].object.metadata?.name, 'custom-pod');
     });
 });
 
@@ -302,19 +319,13 @@ describe('WatchApi type safety', () => {
         ];
 
         const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
-        const testServer = await createTestServer(responseBody);
+        const config = createMockConfiguration(server, responseBody);
+        const watchApi = new WatchApi(config);
 
-        try {
-            const kc = createKubeConfigForServer(testServer.url);
-            const watchApi = kc.makeApiClient(WatchApi);
-
-            for await (const event of watchApi.watch<CustomResource>('/apis/custom.io/v1/customresources')) {
-                // Type should be correctly inferred
-                strictEqual(event.object.spec?.replicas, 3);
-                strictEqual(event.object.metadata?.name, 'my-resource');
-            }
-        } finally {
-            testServer.close();
+        for await (const event of watchApi.watch<CustomResource>('/apis/custom.io/v1/customresources')) {
+            // Type should be correctly inferred
+            strictEqual(event.object.spec?.replicas, 3);
+            strictEqual(event.object.metadata?.name, 'my-resource');
         }
     });
 });

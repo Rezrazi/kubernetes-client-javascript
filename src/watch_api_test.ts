@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import { Readable } from 'node:stream';
 import { deepStrictEqual, strictEqual, rejects } from 'node:assert';
-import { WatchApi, WatchEvent } from './watch_iterator.js';
+import { WatchApi, WatchEvent } from './watch_api.js';
 import {
     ApiException,
     createConfiguration,

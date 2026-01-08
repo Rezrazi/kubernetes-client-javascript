@@ -159,12 +159,6 @@ export class RequestContext {
 export interface ResponseBody {
     text(): Promise<string>;
     binary(): Promise<Buffer>;
-    /**
-     * Returns a readable stream of the response body.
-     * This is optional and used for streaming operations like watch.
-     * When implementing a custom HTTP library, include this method to enable
-     * efficient streaming of watch events without loading the entire response.
-     */
     stream?(): import('node:stream').Readable;
 }
 

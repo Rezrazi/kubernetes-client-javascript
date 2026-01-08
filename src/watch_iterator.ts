@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { KubernetesObject } from './types.js';
-import { Configuration, ApiException, HttpMethod } from './gen/index.js';
+import { ApiException, Configuration, HttpMethod } from './gen/index.js';
 
 /**
  * Represents the type of watch event received from the Kubernetes API.
@@ -153,13 +153,6 @@ export class WatchApi {
      * Watches for changes to Kubernetes resources at the specified path.
      * Returns an async iterator that yields watch events.
      *
-     * Uses the configuration's httpApi to send the request, allowing users to override
-     * the HTTP implementation via `wrapHttpLibrary` and `createConfiguration`.
-     *
-     * For optimal streaming support, custom HTTP libraries should return a response body
-     * with a `stream()` method. If streaming is not available, the full response text
-     * will be parsed.
-     *
      * @typeParam T - The Kubernetes object type to expect (e.g., V1Pod, V1Deployment).
      *
      * @param path - The API path to watch (e.g., '/api/v1/namespaces/default/pods').
@@ -184,8 +177,8 @@ export class WatchApi {
         path: string,
         queryParams: Record<string, string | number | boolean | undefined> = {},
     ): AsyncGenerator<WatchEvent<T>, void, undefined> {
-        // Build request context using the configuration's base server
         const requestContext = this.configuration.baseServer.makeRequestContext(path, HttpMethod.GET);
+
         requestContext.setQueryParam('watch', 'true');
 
         for (const [key, val] of Object.entries(queryParams)) {
@@ -194,23 +187,24 @@ export class WatchApi {
             }
         }
 
-        // Apply authentication
         const authMethod = this.configuration.authMethods.default;
+
         if (authMethod?.applySecurityAuthentication) {
             await authMethod.applySecurityAuthentication(requestContext);
         }
 
-        // Set timeout signal
         const controller = new AbortController();
+
         const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+
         requestContext.setSignal(AbortSignal.any([controller.signal, timeoutSignal]));
 
         try {
-            // Send request using the configured HTTP library
             const response = await this.configuration.httpApi.send(requestContext).toPromise();
 
             if (response.httpStatusCode !== 200) {
                 const body = await response.body.text();
+
                 throw new ApiException(
                     response.httpStatusCode,
                     'Watch request failed',
@@ -219,37 +213,33 @@ export class WatchApi {
                 );
             }
 
-            // Use streaming if available, otherwise fall back to text parsing
             if (response.body.stream) {
+                // Use streaming if available, otherwise fall back to text parsing
                 const stream = response.body.stream();
+
                 const lines = createInterface(stream);
 
                 for await (const line of lines) {
-                    try {
-                        const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
-                        yield {
-                            type: data.type,
-                            object: data.object,
-                        };
-                    } catch {
-                        // ignore parse errors
-                    }
+                    const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
+
+                    yield {
+                        type: data.type,
+                        object: data.object,
+                    };
                 }
             } else {
                 // Fallback: parse full text response line by line
                 const text = await response.body.text();
+
                 const lines = text.split('\n').filter((line) => line.trim() !== '');
 
                 for (const line of lines) {
-                    try {
-                        const data = JSON.parse(line) as { type: WatchEventType; object: T };
-                        yield {
-                            type: data.type,
-                            object: data.object,
-                        };
-                    } catch {
-                        // ignore parse errors
-                    }
+                    const data = JSON.parse(line) as { type: WatchEventType; object: T };
+
+                    yield {
+                        type: data.type,
+                        object: data.object,
+                    };
                 }
             }
         } finally {

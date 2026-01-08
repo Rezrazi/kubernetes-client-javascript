@@ -166,7 +166,7 @@ describe('WatchApi', () => {
         );
     });
 
-    it('should skip invalid JSON lines', async () => {
+    it('should throw on invalid JSON lines', async () => {
         const validEvent = {
             type: 'ADDED',
             object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } },
@@ -175,13 +175,17 @@ describe('WatchApi', () => {
         const config = createMockConfiguration(server, responseBody);
         const watchApi = new WatchApi(config);
 
-        const receivedEvents: WatchEvent<any>[] = [];
-        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-            receivedEvents.push(event);
-        }
+        const iterator = watchApi.watch<any>('/api/v1/namespaces/default/pods')[Symbol.asyncIterator]();
 
-        // Should only receive 2 valid events, skipping the invalid JSON line
-        strictEqual(receivedEvents.length, 2);
+        // First event is valid
+        const first = await iterator.next();
+        strictEqual(first.done, false);
+        strictEqual(first.value.type, 'ADDED');
+
+        // Second line is invalid, so next() should throw
+        await rejects(async () => {
+            await iterator.next();
+        }, SyntaxError);
     });
 
     it('should pass query parameters correctly', async () => {

@@ -14,8 +14,7 @@ import {
 const server = 'https://foo.company.com';
 
 /**
- * Creates a mock configuration with a custom HTTP library for testing.
- * The binary() method now returns a Readable stream as per the updated interface.
+ * Creates a mock configuration with a custom HTTP library for testing WatchApi.
  */
 function createMockConfiguration(baseUrl: string, responseBody: string, statusCode: number = 200) {
     const httpApi = wrapHttpLibrary({

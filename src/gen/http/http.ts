@@ -169,9 +169,12 @@ export class SelfDecodingBody implements ResponseBody {
     constructor(private dataSource: Promise<Buffer>) {}
 
     binary(): Readable {
-        return Readable.from((async function* (dataSource: Promise<Buffer>) {
-            yield await dataSource;
-        })(this.dataSource));
+        const dataSource = this.dataSource;
+        return Readable.from({
+            async *[Symbol.asyncIterator]() {
+                yield await dataSource;
+            }
+        });
     }
 
     async text(): Promise<string> {

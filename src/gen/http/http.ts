@@ -3,6 +3,7 @@ import  FormData from "form-data";
 import { URL, URLSearchParams } from 'url';
 import * as http from 'http';
 import * as https from 'https';
+import { Readable } from 'node:stream';
 import { Observable, from } from '../rxjsStub.js';
 
 export * from './isomorphic-fetch.js';
@@ -158,8 +159,7 @@ export class RequestContext {
 
 export interface ResponseBody {
     text(): Promise<string>;
-    binary(): Promise<Buffer>;
-    stream?(): import('node:stream').Readable;
+    binary(): import('node:stream').Readable;
 }
 
 /**
@@ -168,8 +168,13 @@ export interface ResponseBody {
 export class SelfDecodingBody implements ResponseBody {
     constructor(private dataSource: Promise<Buffer>) {}
 
-    binary(): Promise<Buffer> {
-        return this.dataSource;
+    binary(): Readable {
+        const dataSource = this.dataSource;
+        return Readable.from({
+            async *[Symbol.asyncIterator]() {
+                yield await dataSource;
+            }
+        });
     }
 
     async text(): Promise<string> {
@@ -219,7 +224,11 @@ export class ResponseContext {
     }
 
     public async getBodyAsFile(): Promise<HttpFile> {
-        const data = await this.body.binary();
+        const chunks: Buffer[] = [];
+        for await (const chunk of this.body.binary()) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const data = Buffer.concat(chunks);
         const fileName = this.getParsedHeader("content-disposition")["filename"] || "";
         return { data, name: fileName };
     }
@@ -228,16 +237,20 @@ export class ResponseContext {
      * Use a heuristic to get a body of unknown data structure.
      * Return as string if possible, otherwise as binary.
      */
-    public getBodyAsAny(): Promise<string | Buffer | undefined> {
+    public async getBodyAsAny(): Promise<string | Buffer | undefined> {
         try {
-            return this.body.text();
+            return await this.body.text();
         } catch {}
 
         try {
-            return this.body.binary();
+            const chunks: Buffer[] = [];
+            for await (const chunk of this.body.binary()) {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            return Buffer.concat(chunks);
         } catch {}
 
-        return Promise.resolve(undefined);
+        return undefined;
     }
 }
 

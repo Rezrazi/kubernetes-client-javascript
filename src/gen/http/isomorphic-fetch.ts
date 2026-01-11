@@ -1,6 +1,7 @@
 import {HttpLibrary, RequestContext, ResponseContext} from './http.js';
 import { from, Observable } from '../rxjsStub.js';
 import fetch from "node-fetch";
+import { Readable } from 'node:stream';
 
 export class IsomorphicFetchHttpLibrary implements HttpLibrary {
 
@@ -22,7 +23,7 @@ export class IsomorphicFetchHttpLibrary implements HttpLibrary {
 
             const body = {
               text: () => resp.text(),
-              binary: () => resp.buffer()
+              binary: () => resp.body ?? Readable.from([])
             };
             return new ResponseContext(resp.status, headers, body);
         });

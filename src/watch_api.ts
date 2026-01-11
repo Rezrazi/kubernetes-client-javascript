@@ -47,8 +47,8 @@ export interface WatchEvent<T extends KubernetesObject> {
  * and override the HTTP library via `wrapHttpLibrary` and `createConfiguration`.
  *
  * The class uses the configuration's `httpApi` to send requests, enabling custom
- * HTTP implementations. For optimal streaming support, custom HTTP libraries should
- * return a response body with a `stream()` method that returns a Readable stream.
+ * HTTP implementations. For streaming support, custom HTTP libraries should
+ * return a response body with a `binary()` method that returns a Readable stream.
  *
  * @example Using with makeApiClient:
  * ```typescript
@@ -83,8 +83,7 @@ export interface WatchEvent<T extends KubernetesObject> {
  *       Object.fromEntries(response.headers.entries()),
  *       {
  *         text: () => response.text(),
- *         binary: async () => Buffer.from(await response.arrayBuffer()),
- *         stream: () => Readable.fromWeb(response.body),  // Enable streaming for watch
+ *         binary: () => Readable.fromWeb(response.body),  // Returns Readable stream for watch
  *       },
  *     );
  *   },
@@ -213,34 +212,18 @@ export class WatchApi {
                 );
             }
 
-            if (response.body.stream) {
-                // Use streaming if available, otherwise fall back to text parsing
-                const stream = response.body.stream();
+            // Use the binary() method which returns a Readable stream
+            const stream = response.body.binary();
 
-                const lines = createInterface(stream);
+            const lines = createInterface(stream);
 
-                for await (const line of lines) {
-                    const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
+            for await (const line of lines) {
+                const data = JSON.parse(line.toString()) as { type: WatchEventType; object: T };
 
-                    yield {
-                        type: data.type,
-                        object: data.object,
-                    };
-                }
-            } else {
-                // Fallback: parse full text response line by line
-                const text = await response.body.text();
-
-                const lines = text.split('\n').filter((line) => line.trim() !== '');
-
-                for (const line of lines) {
-                    const data = JSON.parse(line) as { type: WatchEventType; object: T };
-
-                    yield {
-                        type: data.type,
-                        object: data.object,
-                    };
-                }
+                yield {
+                    type: data.type,
+                    object: data.object,
+                };
             }
         } finally {
             controller.abort();

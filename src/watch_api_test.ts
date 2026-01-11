@@ -15,25 +15,15 @@ const server = 'https://foo.company.com';
 
 /**
  * Creates a mock configuration with a custom HTTP library for testing.
+ * The binary() method now returns a Readable stream as per the updated interface.
  */
-function createMockConfiguration(
-    baseUrl: string,
-    responseBody: string,
-    statusCode: number = 200,
-    useStreaming: boolean = false,
-) {
+function createMockConfiguration(baseUrl: string, responseBody: string, statusCode: number = 200) {
     const httpApi = wrapHttpLibrary({
         async send(_request: RequestContext): Promise<ResponseContext> {
-            const body = useStreaming
-                ? {
-                      text: () => Promise.resolve(responseBody),
-                      binary: () => Promise.resolve(Buffer.from(responseBody)),
-                      stream: () => Readable.from(responseBody),
-                  }
-                : {
-                      text: () => Promise.resolve(responseBody),
-                      binary: () => Promise.resolve(Buffer.from(responseBody)),
-                  };
+            const body = {
+                text: () => Promise.resolve(responseBody),
+                binary: () => Readable.from(responseBody),
+            };
 
             return new ResponseContext(statusCode, {}, body);
         },
@@ -59,7 +49,7 @@ describe('WatchApi', () => {
         strictEqual(watchApi instanceof WatchApi, true);
     });
 
-    it('should iterate over watch events using text fallback', async () => {
+    it('should iterate over watch events', async () => {
         const events = [
             { type: 'ADDED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
             { type: 'MODIFIED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
@@ -68,29 +58,6 @@ describe('WatchApi', () => {
 
         const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
         const config = createMockConfiguration(server, responseBody);
-        const watchApi = new WatchApi(config);
-
-        const receivedEvents: WatchEvent<any>[] = [];
-        for await (const event of watchApi.watch('/api/v1/namespaces/default/pods')) {
-            receivedEvents.push(event);
-        }
-
-        strictEqual(receivedEvents.length, 3);
-        deepStrictEqual(receivedEvents[0].type, 'ADDED');
-        deepStrictEqual(receivedEvents[1].type, 'MODIFIED');
-        deepStrictEqual(receivedEvents[2].type, 'DELETED');
-        deepStrictEqual(receivedEvents[0].object.metadata?.name, 'pod1');
-    });
-
-    it('should iterate over watch events using streaming', async () => {
-        const events = [
-            { type: 'ADDED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
-            { type: 'MODIFIED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
-            { type: 'DELETED', object: { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'pod1' } } },
-        ];
-
-        const responseBody = events.map((e) => JSON.stringify(e)).join('\n');
-        const config = createMockConfiguration(server, responseBody, 200, true);
         const watchApi = new WatchApi(config);
 
         const receivedEvents: WatchEvent<any>[] = [];
@@ -203,7 +170,7 @@ describe('WatchApi', () => {
                     {},
                     {
                         text: () => Promise.resolve(JSON.stringify(event)),
-                        binary: () => Promise.resolve(Buffer.from(JSON.stringify(event))),
+                        binary: () => Readable.from(JSON.stringify(event)),
                     },
                 );
             },
@@ -271,8 +238,7 @@ describe('WatchApi with custom HTTP library', () => {
                     { 'content-type': 'application/json' },
                     {
                         text: () => Promise.resolve(responseBody),
-                        binary: () => Promise.resolve(Buffer.from(responseBody)),
-                        stream: () => Readable.from(responseBody),
+                        binary: () => Readable.from(responseBody),
                     },
                 );
             },

@@ -553,7 +553,7 @@ export class KubeConfig implements SecurityAuthentication {
         );
     }
 
-    public makeConfiguration(): Configuration {
+    public makeApiClient<T extends ApiType>(apiClientType: ApiConstructor<T>): T {
         const cluster = this.getCurrentCluster();
         if (!cluster) {
             throw new Error('No active cluster!');
@@ -562,16 +562,15 @@ export class KubeConfig implements SecurityAuthentication {
             default: this,
         };
         const baseServerConfig: ServerConfiguration<{}> = new ServerConfiguration<{}>(cluster.server, {});
-        return createConfiguration({
+        const config: Configuration = createConfiguration({
             baseServer: baseServerConfig,
             authMethods: authConfig,
             middleware: [setHeaderMiddleware(USER_AGENT_KEY, getUserAgent())],
         });
-    }
 
-    public makeApiClient<T extends ApiType>(apiClientType: ApiConstructor<T>): T {
-        const config = this.makeConfiguration();
-        return new apiClientType(config);
+        const apiClient = new apiClientType(config);
+
+        return apiClient;
     }
 
     public makePathsAbsolute(rootDirectory: string): void {

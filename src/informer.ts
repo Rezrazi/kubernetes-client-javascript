@@ -25,6 +25,15 @@ export type CONNECT = typeof CONNECT;
 export const ERROR = 'error';
 export type ERROR = typeof ERROR;
 
+export interface Watchable {
+    watch(
+        path: string,
+        queryParams: Record<string, string | number | boolean | undefined>,
+        callback: (phase: string, apiObj: any, watchObj?: any) => void,
+        done: (err: any) => void,
+    ): Promise<AbortController>;
+}
+
 export interface Informer<T extends KubernetesObject> {
     on(verb: ADD | UPDATE | DELETE | CHANGE, cb: ObjectCallback<T>): void;
     on(verb: ERROR | CONNECT, cb: ErrorCallback): void;

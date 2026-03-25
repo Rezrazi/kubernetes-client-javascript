@@ -9,10 +9,10 @@ import {
     ListPromise,
     ObjectCallback,
     UPDATE,
+    Watchable,
 } from './informer.js';
 import { KubernetesObject, KubernetesListObject } from './types.js';
 import { ObjectSerializer } from './serializer.js';
-import { Watch } from './watch.js';
 
 export interface ObjectCache<T> {
     get(name: string, namespace?: string): T | undefined;
@@ -31,14 +31,14 @@ export class ListWatch<T extends KubernetesObject> implements ObjectCache<T>, In
     private request: AbortController | undefined;
     private stopped: boolean = false;
     private readonly path: string;
-    private readonly watch: Watch;
+    private readonly watch: Watchable;
     private readonly listFn: ListPromise<T>;
     private readonly labelSelector?: string;
     private readonly fieldSelector?: string;
 
     public constructor(
         path: string,
-        watch: Watch,
+        watch: Watchable,
         listFn: ListPromise<T>,
         autoStart: boolean = true,
         labelSelector?: string,
